@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($PSVersionTable.PSVersion.ToString\\(\\); Get-Location)",
+      "PowerShell(\"---\")"
+    ]
+  }
+}

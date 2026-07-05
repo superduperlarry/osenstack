@@ -1,0 +1,1746 @@
+openapi: 3.1.0
+info:
+  title: Enstack Agent OS API
+  version: 1.0.0-draft.1
+  summary: Give your AI agents real money — and real control.
+  description: |
+    # Enstack Agent OS — /v1 API
+
+    The Agent OS API lets a verified **Owner** (a person or business) provision
+    **Agents** — AI sub-principals that hold a Balance, spend on a Visa card,
+    receive into a virtual bank account, and move money over local and
+    cross-border rails via **Enstack Routing** — all inside an Owner-defined
+    **Policy** (limits, allowlists, human approvals, full audit).
+
+    ## Identity model
+    - **Owner** — the KYC/KYB-verified principal. Owns all funds and all liability.
+    - **Agent** — a sub-principal under an Owner. No separate KYC. Every agent
+      action is attributable to both the agent and its owner.
+    - **Credential** — a scoped API key or MCP token bound to exactly one agent
+      (or to the owner). Credentials carry scopes; scopes are further constrained
+      by the agent's Policy at execution time.
+    - **Policy** — the authorization layer: per-transaction / daily / monthly
+      limits, counterparty and category allowlists, and human-in-the-loop
+      approval rules. Policy is versioned; every evaluation is audited.
+
+    ## Conventions
+    - **Versioning**: URL prefix `/v1/...`. Breaking changes ship as `/v2`.
+    - **Idempotency**: `Idempotency-Key` header is **required on every mutating
+      request** (POST/PUT/PATCH). Window: 24h, keyed by `(credential, key)`.
+      Same key + same body → the original response is replayed.
+      Same key + different body → `409 Conflict`.
+    - **Money**: decimal strings with explicit currency. Never floats.
+    - **Errors**: standard envelope `{ code, message, details, request_id }`.
+    - **Pagination**: cursor-based — `limit` + `starting_after`; responses carry
+      `has_more` and `next_cursor`.
+    - **Field selection**: `?fields=` comma list for over-fetch control
+      (no GraphQL).
+    - **Human-in-the-loop**: requests that exceed Policy do not fail — they
+      return `202` with a `pending_approval` object. The Owner approves or
+      rejects in the console (or via owner-scoped API); the caller learns the
+      outcome by webhook or by polling.
+
+    ## Authentication
+    Two credential classes, both sent as `Authorization: Bearer <token>`:
+    - **Owner keys** (`ok_live_...` / `ok_test_...`) — full account scope:
+      manage agents, credentials, policies, decide approvals.
+    - **Agent credentials** (`ac_live_...` / `ac_test_...`) — scoped to one
+      agent; can only act within that agent's Policy. Policy is enforced
+      server-side on every call regardless of credential scopes.
+
+    ## Environments
+    - Sandbox: `https://sandbox.api.enosone.com/v1`
+    - Production: `https://api.enosone.com/v1`
+  contact:
+    name: Enstack Agent OS
+    email: hello@enosone.com
+  x-audience: external-developer
+  x-status: DRAFT for internal review — Phase 0 sandbox contract
+servers:
+  - url: https://sandbox.api.enosone.com/v1
+    description: Sandbox (Phase 0)
+  - url: https://api.enosone.com/v1
+    description: Production (Phase 2 GA)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Owner
+    description: The verified principal. Read profile and account-level balances.
+  - name: Agents
+    description: Provision and manage agents (sub-principals).
+  - name: Credentials
+    description: Scoped API keys and MCP tokens bound to an agent or owner.
+  - name: Policies
+    description: Limits, allowlists, and approval rules per agent. Owner scope only.
+  - name: Balances & Transfers
+    description: Agent balances, funding instructions, and instant internal transfers.
+  - name: Quotes
+    description: Priced quotes for cross-currency payments. Quotes are firm until expiry.
+  - name: Payments
+    description: Outbound payments over local and cross-border rails via Enstack Routing.
+  - name: Counterparties
+    description: Saved payees. Allowlisting happens in Policy by counterparty ID.
+  - name: Cards
+    description: White-label Visa cards issued per agent.
+  - name: Virtual Accounts
+    description: Named virtual bank accounts for receiving into an agent's balance.
+  - name: Approvals
+    description: Human-in-the-loop queue. Deciding approvals requires owner scope.
+  - name: Activity
+    description: Unified, append-only event feed across all agents and products.
+  - name: Webhooks
+    description: Webhook endpoint management. Payload contracts live in the AsyncAPI spec.
+
+paths:
+  # ───────────────────────────── Owner ─────────────────────────────
+  /owner:
+    get:
+      operationId: getOwner
+      tags: [Owner]
+      summary: Retrieve the current owner profile
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Owner profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Owner' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /balances:
+    get:
+      operationId: listBalances
+      tags: [Balances & Transfers]
+      summary: List all balances (owner treasury + every agent)
+      description: Owner scope returns all balances; agent scope returns only its own.
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Balance list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Balance' }
+                  has_more: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ───────────────────────────── Agents ─────────────────────────────
+  /agents:
+    post:
+      operationId: createAgent
+      tags: [Agents]
+      summary: Create an agent
+      description: |
+        Owner scope only. Creates a sub-principal with a zero balance and the
+        default (deny-all) policy. Attach a Policy before the agent can move money.
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentCreate' }
+      responses:
+        '201':
+          description: Agent created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Agent' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listAgents
+      tags: [Agents]
+      summary: List agents
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/AgentStatus' }
+      responses:
+        '200':
+          description: Agent list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Agent' }
+                  has_more: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+
+  /agents/{agent_id}:
+    parameters:
+      - $ref: '#/components/parameters/agentId'
+    get:
+      operationId: getAgent
+      tags: [Agents]
+      summary: Retrieve an agent
+      responses:
+        '200':
+          description: The agent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Agent' }
+        default: { $ref: '#/components/responses/Error' }
+    patch:
+      operationId: updateAgent
+      tags: [Agents]
+      summary: Update agent metadata
+      description: Owner scope only. Name, description, and metadata only — status changes use the suspend/reactivate actions; authorization changes live in Policy.
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentUpdate' }
+      responses:
+        '200':
+          description: Updated agent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Agent' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /agents/{agent_id}/suspend:
+    post:
+      operationId: suspendAgent
+      tags: [Agents]
+      summary: Suspend an agent
+      description: |
+        Owner scope only. Immediately freezes the agent: credentials stop
+        authenticating, cards decline, in-flight payments continue to terminal
+        state. Reversible via reactivate.
+      parameters:
+        - $ref: '#/components/parameters/agentId'
+        - $ref: '#/components/parameters/idempotencyKey'
+      responses:
+        '200':
+          description: Suspended agent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Agent' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /agents/{agent_id}/reactivate:
+    post:
+      operationId: reactivateAgent
+      tags: [Agents]
+      summary: Reactivate a suspended agent
+      parameters:
+        - $ref: '#/components/parameters/agentId'
+        - $ref: '#/components/parameters/idempotencyKey'
+      responses:
+        '200':
+          description: Reactivated agent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Agent' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ─────────────────────────── Credentials ───────────────────────────
+  /agents/{agent_id}/credentials:
+    parameters:
+      - $ref: '#/components/parameters/agentId'
+    post:
+      operationId: createCredential
+      tags: [Credentials]
+      summary: Issue a credential for an agent
+      description: |
+        Owner scope only. Returns the secret **once**. `kind: mcp` credentials
+        authenticate against the Agent OS MCP server; `kind: api` against this
+        REST surface. Scopes requested here are intersected with the agent's
+        Policy at every call.
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CredentialCreate' }
+      responses:
+        '201':
+          description: Credential created. `secret` is returned only in this response.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CredentialWithSecret' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listCredentials
+      tags: [Credentials]
+      summary: List an agent's credentials
+      responses:
+        '200':
+          description: Credentials (secrets never included).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Credential' }
+                  has_more: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+
+  /credentials/{credential_id}/revoke:
+    post:
+      operationId: revokeCredential
+      tags: [Credentials]
+      summary: Revoke a credential
+      description: Owner scope only. Irreversible; issue a new credential to restore access.
+      parameters:
+        - name: credential_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/idempotencyKey'
+      responses:
+        '200':
+          description: Revoked credential.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Credential' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ───────────────────────────── Policy ─────────────────────────────
+  /agents/{agent_id}/policy:
+    parameters:
+      - $ref: '#/components/parameters/agentId'
+    get:
+      operationId: getPolicy
+      tags: [Policies]
+      summary: Retrieve an agent's active policy
+      description: Agent credentials may read their own policy (so agents can plan within limits). Writes are owner scope only.
+      responses:
+        '200':
+          description: Active policy.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Policy' }
+        default: { $ref: '#/components/responses/Error' }
+    put:
+      operationId: replacePolicy
+      tags: [Policies]
+      summary: Replace an agent's policy
+      description: |
+        Owner scope only. Policies are replaced whole, never patched — every PUT
+        creates a new immutable version; prior versions remain queryable in the
+        activity feed. Applies to new authorizations immediately.
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PolicyCreate' }
+      responses:
+        '200':
+          description: New active policy version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Policy' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ─────────────────────── Balances & Transfers ───────────────────────
+  /agents/{agent_id}/balance:
+    get:
+      operationId: getAgentBalance
+      tags: [Balances & Transfers]
+      summary: Retrieve an agent's balance
+      parameters:
+        - $ref: '#/components/parameters/agentId'
+      responses:
+        '200':
+          description: The balance.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Balance' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /agents/{agent_id}/funding_instructions:
+    get:
+      operationId: getFundingInstructions
+      tags: [Balances & Transfers]
+      summary: Retrieve funding instructions for an agent's balance
+      description: |
+        Returns the named virtual account details (account name, number,
+        bank, supported rails, reference) that credit this agent's balance
+        when funds arrive.
+      parameters:
+        - $ref: '#/components/parameters/agentId'
+      responses:
+        '200':
+          description: Funding instructions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FundingInstructions' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /transfers:
+    post:
+      operationId: createTransfer
+      tags: [Balances & Transfers]
+      summary: Move funds between balances inside the account
+      description: |
+        Instant, fee-free internal ledger transfer: owner treasury ↔ agent, or
+        agent ↔ agent. Policy-evaluated when initiated by an agent credential.
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferCreate' }
+      responses:
+        '201':
+          description: Transfer completed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transfer' }
+        '202':
+          description: Transfer requires owner approval per Policy.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transfer' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listTransfers
+      tags: [Balances & Transfers]
+      summary: List internal transfers
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+        - name: agent_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Transfer list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transfer' }
+                  has_more: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ───────────────────────────── Quotes ─────────────────────────────
+  /quotes:
+    post:
+      operationId: createQuote
+      tags: [Quotes]
+      summary: Create a quote
+      description: |
+        Prices a payment: source amount/currency → destination amount/currency
+        over the best route Enstack Routing can offer. Quotes are firm until
+        `expires_at`. Pass `quote_id` into payment creation to execute at the
+        quoted rate.
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuoteCreate' }
+      responses:
+        '201':
+          description: Quote created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quote' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /quotes/{quote_id}:
+    get:
+      operationId: getQuote
+      tags: [Quotes]
+      summary: Retrieve a quote
+      parameters:
+        - name: quote_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The quote.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quote' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ──────────────────────────── Payments ────────────────────────────
+  /payments:
+    post:
+      operationId: createPayment
+      tags: [Payments]
+      summary: Create a payment
+      description: |
+        Sends funds from an agent's balance to a counterparty over the best
+        available rail (local instant rails, bank transfer, or cross-border via
+        Enstack Routing — rail selection is automatic unless pinned).
+
+        **Policy evaluation happens here.** Outcomes:
+        - Within policy → `201`, status `processing`.
+        - Exceeds a limit or misses the allowlist but is approvable →
+          `202`, status `pending_approval`; an Approval object is created and
+          the owner is notified.
+        - Hard-denied by policy → `403` with code `policy_denied`.
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentCreate' }
+      responses:
+        '201':
+          description: Payment accepted and processing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '202':
+          description: Payment created but held pending owner approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listPayments
+      tags: [Payments]
+      summary: List payments
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+        - name: agent_id
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/PaymentStatus' }
+        - name: created_after
+          in: query
+          schema: { type: string, format: date-time }
+        - name: created_before
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Payment list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Payment' }
+                  has_more: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+
+  /payments/{payment_id}:
+    get:
+      operationId: getPayment
+      tags: [Payments]
+      summary: Retrieve a payment
+      parameters:
+        - name: payment_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The payment, including its routing and status timeline.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /payments/{payment_id}/cancel:
+    post:
+      operationId: cancelPayment
+      tags: [Payments]
+      summary: Cancel a payment
+      description: Only payments in `pending_approval` or pre-dispatch `processing` can be cancelled. Cancellation of a dispatched payment returns `409`.
+      parameters:
+        - name: payment_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/idempotencyKey'
+      responses:
+        '200':
+          description: Cancelled payment.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ─────────────────────────── Counterparties ───────────────────────────
+  /counterparties:
+    post:
+      operationId: createCounterparty
+      tags: [Counterparties]
+      summary: Create a counterparty
+      description: |
+        Saves a payee (bank account, wallet, or card payout destination).
+        Counterparties created by an agent credential start `unverified`;
+        Policy can require `verified` (owner-confirmed) counterparties only.
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CounterpartyCreate' }
+      responses:
+        '201':
+          description: Counterparty created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Counterparty' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listCounterparties
+      tags: [Counterparties]
+      summary: List counterparties
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/CounterpartyStatus' }
+      responses:
+        '200':
+          description: Counterparty list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Counterparty' }
+                  has_more: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+
+  /counterparties/{counterparty_id}:
+    get:
+      operationId: getCounterparty
+      tags: [Counterparties]
+      summary: Retrieve a counterparty
+      parameters:
+        - name: counterparty_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The counterparty.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Counterparty' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /counterparties/{counterparty_id}/verify:
+    post:
+      operationId: verifyCounterparty
+      tags: [Counterparties]
+      summary: Verify a counterparty
+      description: Owner scope only. Marks the counterparty owner-confirmed, making it eligible under `verified_counterparties_only` policies.
+      parameters:
+        - name: counterparty_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/idempotencyKey'
+      responses:
+        '200':
+          description: Verified counterparty.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Counterparty' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ───────────────────────────── Cards ─────────────────────────────
+  /agents/{agent_id}/cards:
+    parameters:
+      - $ref: '#/components/parameters/agentId'
+    post:
+      operationId: createCard
+      tags: [Cards]
+      summary: Issue a card for an agent
+      description: |
+        Issues a virtual Visa card funded by the agent's balance. Card
+        authorizations are evaluated against the agent's Policy in real time
+        (limits, merchant-category allowlists). Physical cards: Phase 2.
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CardCreate' }
+      responses:
+        '201':
+          description: Card issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Card' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listCards
+      tags: [Cards]
+      summary: List an agent's cards
+      responses:
+        '200':
+          description: Card list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Card' }
+                  has_more: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+
+  /cards/{card_id}:
+    get:
+      operationId: getCard
+      tags: [Cards]
+      summary: Retrieve a card
+      description: PAN and CVV are never returned by this endpoint; sensitive card details are revealed only through the secure display flow in the app or a PCI-scoped reveal token.
+      parameters:
+        - name: card_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The card (masked).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Card' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /cards/{card_id}/freeze:
+    post:
+      operationId: freezeCard
+      tags: [Cards]
+      summary: Freeze a card
+      description: Available to both owner and the card's own agent (an agent may freeze, but not unfreeze, its own card).
+      parameters:
+        - name: card_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/idempotencyKey'
+      responses:
+        '200':
+          description: Frozen card.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Card' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /cards/{card_id}/unfreeze:
+    post:
+      operationId: unfreezeCard
+      tags: [Cards]
+      summary: Unfreeze a card
+      description: Owner scope only.
+      parameters:
+        - name: card_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/idempotencyKey'
+      responses:
+        '200':
+          description: Active card.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Card' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ──────────────────────── Virtual Accounts ────────────────────────
+  /agents/{agent_id}/virtual_accounts:
+    parameters:
+      - $ref: '#/components/parameters/agentId'
+    post:
+      operationId: createVirtualAccount
+      tags: [Virtual Accounts]
+      summary: Create a virtual account for an agent
+      description: |
+        Provisions a named virtual bank account whose inbound credits post to
+        the agent's balance. Account naming follows the scheme
+        `{owner_legal_name} — {agent_display_name}` subject to banking-partner
+        naming rules.
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VirtualAccountCreate' }
+      responses:
+        '201':
+          description: Virtual account created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VirtualAccount' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listVirtualAccounts
+      tags: [Virtual Accounts]
+      summary: List an agent's virtual accounts
+      responses:
+        '200':
+          description: Virtual account list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/VirtualAccount' }
+                  has_more: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+
+  /virtual_accounts/{virtual_account_id}:
+    get:
+      operationId: getVirtualAccount
+      tags: [Virtual Accounts]
+      summary: Retrieve a virtual account
+      parameters:
+        - name: virtual_account_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The virtual account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VirtualAccount' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ──────────────────────────── Approvals ────────────────────────────
+  /approvals:
+    get:
+      operationId: listApprovals
+      tags: [Approvals]
+      summary: List approvals
+      description: Owner scope sees all; an agent credential sees only approvals raised by its own actions.
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/ApprovalStatus' }
+        - name: agent_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Approval list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Approval' }
+                  has_more: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+
+  /approvals/{approval_id}:
+    get:
+      operationId: getApproval
+      tags: [Approvals]
+      summary: Retrieve an approval
+      parameters:
+        - name: approval_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Approval' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /approvals/{approval_id}/approve:
+    post:
+      operationId: approveApproval
+      tags: [Approvals]
+      summary: Approve a pending action
+      description: Owner scope only. Releases the held action (payment, transfer, …) for execution at the current quote/route — if the underlying quote has expired, the action is repriced and the approval records both amounts.
+      parameters:
+        - name: approval_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Approved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Approval' }
+        default: { $ref: '#/components/responses/Error' }
+
+  /approvals/{approval_id}/reject:
+    post:
+      operationId: rejectApproval
+      tags: [Approvals]
+      summary: Reject a pending action
+      description: Owner scope only. The held action transitions to `cancelled` with reason `owner_rejected`.
+      parameters:
+        - name: approval_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Approval' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ──────────────────────────── Activity ────────────────────────────
+  /activity:
+    get:
+      operationId: listActivity
+      tags: [Activity]
+      summary: List activity events
+      description: |
+        Unified append-only feed: payments, transfers, card authorizations and
+        declines, balance credits, policy evaluations, approvals, credential
+        events. Every event carries both `agent_id` and the acting credential —
+        full attribution, always.
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+        - name: agent_id
+          in: query
+          schema: { type: string }
+        - name: type
+          in: query
+          schema: { type: string }
+          description: Dot-notation event type filter, e.g. `payment.completed` or prefix `card.*`.
+        - name: occurred_after
+          in: query
+          schema: { type: string, format: date-time }
+        - name: occurred_before
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Activity events, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ActivityEvent' }
+                  has_more: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+
+  /activity/{event_id}:
+    get:
+      operationId: getActivityEvent
+      tags: [Activity]
+      summary: Retrieve an activity event
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActivityEvent' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ──────────────────────────── Webhooks ────────────────────────────
+  /webhook_endpoints:
+    post:
+      operationId: createWebhookEndpoint
+      tags: [Webhooks]
+      summary: Register a webhook endpoint
+      description: |
+        Owner scope only. Deliveries are HMAC-SHA256 signed
+        (`Enstack-Signature` header), retried with exponential backoff, and
+        replayable from the console. Payload schemas are defined in the
+        companion **AsyncAPI** specification.
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookEndpointCreate' }
+      responses:
+        '201':
+          description: Endpoint registered. `secret` is returned only in this response.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpointWithSecret' }
+        default: { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listWebhookEndpoints
+      tags: [Webhooks]
+      summary: List webhook endpoints
+      responses:
+        '200':
+          description: Endpoint list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, has_more]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/WebhookEndpoint' }
+                  has_more: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Error' }
+
+  /webhook_endpoints/{webhook_endpoint_id}:
+    delete:
+      operationId: deleteWebhookEndpoint
+      tags: [Webhooks]
+      summary: Delete a webhook endpoint
+      parameters:
+        - name: webhook_endpoint_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/idempotencyKey'
+      responses:
+        '204':
+          description: Deleted.
+        default: { $ref: '#/components/responses/Error' }
+
+  /webhook_endpoints/{webhook_endpoint_id}/rotate_secret:
+    post:
+      operationId: rotateWebhookSecret
+      tags: [Webhooks]
+      summary: Rotate a webhook signing secret
+      description: Old secret remains valid for 24h to allow zero-downtime rotation.
+      parameters:
+        - name: webhook_endpoint_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/idempotencyKey'
+      responses:
+        '200':
+          description: New secret (returned only in this response).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEndpointWithSecret' }
+        default: { $ref: '#/components/responses/Error' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: |
+        Owner key (`ok_live_…`) or agent credential (`ac_live_…`).
+        Agent credentials are policy-bound: server-side Policy evaluation
+        applies to every call regardless of credential scopes.
+
+  parameters:
+    idempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Client-generated unique key (UUIDv4 recommended). Required on every
+        mutating request. 24h dedup window keyed by (credential, key).
+        Same key + same body replays the original response; same key +
+        different body returns 409.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+    agentId:
+      name: agent_id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Agent identifier, e.g. `agt_01J….`
+    limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    starting_after:
+      name: starting_after
+      in: query
+      schema: { type: string }
+      description: Cursor — the `next_cursor` value from the previous page.
+
+  responses:
+    Error:
+      description: |
+        Error envelope. Notable codes: `policy_denied` (403, hard policy
+        block), `insufficient_funds` (409), `idempotency_conflict` (409,
+        key reuse with different body), `quote_expired` (409),
+        `approval_required` is NOT an error — held actions return 202.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code.
+          examples: [policy_denied, insufficient_funds, quote_expired, idempotency_conflict, not_found, unauthorized, validation_error, rate_limited]
+        message:
+          type: string
+          description: Human-readable description.
+        details:
+          type: [object, 'null']
+          description: Field-level or context detail (e.g. which policy rule denied).
+          additionalProperties: true
+        request_id:
+          type: string
+          description: Correlate with support and the activity feed.
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^-?\d+(\.\d+)?$'
+          description: Decimal string. Never a float.
+          examples: ["1500.00", "0.4275"]
+        currency:
+          type: string
+          description: ISO 4217 code.
+          examples: [USD, PHP, HKD, EUR, SGD]
+
+    Owner:
+      type: object
+      required: [id, type, legal_name, verification_status, created_at]
+      properties:
+        id: { type: string, examples: [own_01JABCDXYZ] }
+        type: { type: string, enum: [individual, business] }
+        legal_name: { type: string }
+        display_name: { type: [string, 'null'] }
+        verification_status:
+          type: string
+          enum: [pending, verified, action_required]
+          description: KYC (individual) or KYB (business) status. Agents cannot transact until the owner is `verified`.
+        country: { type: string, description: ISO 3166-1 alpha-2 }
+        default_currency: { type: string }
+        created_at: { type: string, format: date-time }
+
+    AgentStatus:
+      type: string
+      enum: [active, suspended, deactivated]
+
+    Agent:
+      type: object
+      required: [id, owner_id, display_name, status, policy_version, created_at]
+      properties:
+        id: { type: string, examples: [agt_01JABCDXYZ] }
+        owner_id: { type: string }
+        display_name:
+          type: string
+          description: Appears on virtual account naming and card descriptors.
+        description: { type: [string, 'null'] }
+        status: { $ref: '#/components/schemas/AgentStatus' }
+        policy_version:
+          type: integer
+          description: Version number of the active policy (0 = default deny-all).
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+          description: Free-form key-value store (max 40 keys).
+        created_at: { type: string, format: date-time }
+
+    AgentCreate:
+      type: object
+      required: [display_name]
+      properties:
+        display_name: { type: string, minLength: 1, maxLength: 80 }
+        description: { type: string, maxLength: 500 }
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+
+    AgentUpdate:
+      type: object
+      properties:
+        display_name: { type: string, minLength: 1, maxLength: 80 }
+        description: { type: string, maxLength: 500 }
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+
+    CredentialKind:
+      type: string
+      enum: [api, mcp]
+      description: "`api` authenticates against this REST surface; `mcp` against the Agent OS MCP server."
+
+    CredentialScope:
+      type: string
+      enum:
+        - balance:read
+        - quotes:create
+        - payments:create
+        - payments:read
+        - transfers:create
+        - transfers:read
+        - counterparties:create
+        - counterparties:read
+        - cards:read
+        - cards:freeze
+        - approvals:read
+        - activity:read
+        - policy:read
+      description: Requested capability. Effective capability = scopes ∩ Policy.
+
+    Credential:
+      type: object
+      required: [id, agent_id, kind, scopes, status, created_at]
+      properties:
+        id: { type: string, examples: [crd_01JABCDXYZ] }
+        agent_id: { type: string }
+        kind: { $ref: '#/components/schemas/CredentialKind' }
+        label: { type: [string, 'null'], description: Human label, e.g. "prod procurement agent". }
+        scopes:
+          type: array
+          items: { $ref: '#/components/schemas/CredentialScope' }
+        status: { type: string, enum: [active, revoked] }
+        last_used_at: { type: [string, 'null'], format: date-time }
+        expires_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    CredentialCreate:
+      type: object
+      required: [kind, scopes]
+      properties:
+        kind: { $ref: '#/components/schemas/CredentialKind' }
+        label: { type: string, maxLength: 120 }
+        scopes:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/CredentialScope' }
+        expires_at:
+          type: string
+          format: date-time
+          description: Optional hard expiry. Recommended for MCP tokens.
+
+    CredentialWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/Credential'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: The bearer token. Shown once; store securely.
+              examples: [ac_live_9f3K…]
+
+    Policy:
+      type: object
+      required: [agent_id, version, limits, approvals, created_at]
+      properties:
+        agent_id: { type: string }
+        version: { type: integer }
+        limits: { $ref: '#/components/schemas/PolicyLimits' }
+        counterparty_allowlist:
+          type: [array, 'null']
+          items: { type: string }
+          description: Counterparty IDs the agent may pay. `null` = no allowlist restriction.
+        verified_counterparties_only:
+          type: boolean
+          default: false
+          description: If true, the agent may only pay owner-verified counterparties.
+        merchant_category_allowlist:
+          type: [array, 'null']
+          items: { type: string }
+          description: Card MCC codes permitted. `null` = all categories.
+        currency_allowlist:
+          type: [array, 'null']
+          items: { type: string }
+          description: Destination currencies permitted for payments. `null` = all supported.
+        approvals: { $ref: '#/components/schemas/PolicyApprovals' }
+        created_at: { type: string, format: date-time }
+
+    PolicyLimits:
+      type: object
+      properties:
+        per_transaction: { $ref: '#/components/schemas/Money' }
+        daily: { $ref: '#/components/schemas/Money' }
+        monthly: { $ref: '#/components/schemas/Money' }
+        max_transactions_per_day:
+          type: [integer, 'null']
+          description: Velocity limit. `null` = unlimited count.
+      description: |
+        Limits are expressed in the owner's default currency; cross-currency
+        actions are converted at the prevailing rate for evaluation. Omitted
+        limit = unlimited for that dimension (not recommended).
+
+    PolicyApprovals:
+      type: object
+      properties:
+        require_approval_above: { $ref: '#/components/schemas/Money' }
+        require_approval_for_new_counterparties:
+          type: boolean
+          default: true
+        require_approval_for_cross_border:
+          type: boolean
+          default: false
+        auto_expire_hours:
+          type: integer
+          default: 72
+          description: Pending approvals expire (→ cancelled) after this many hours.
+      description: When a rule triggers, the action is held (HTTP 202) and an Approval is raised — the action does not fail.
+
+    PolicyCreate:
+      type: object
+      required: [limits, approvals]
+      properties:
+        limits: { $ref: '#/components/schemas/PolicyLimits' }
+        counterparty_allowlist:
+          type: [array, 'null']
+          items: { type: string }
+        verified_counterparties_only: { type: boolean, default: false }
+        merchant_category_allowlist:
+          type: [array, 'null']
+          items: { type: string }
+        currency_allowlist:
+          type: [array, 'null']
+          items: { type: string }
+        approvals: { $ref: '#/components/schemas/PolicyApprovals' }
+
+    Balance:
+      type: object
+      required: [holder_type, holder_id, available, currency_breakdown, updated_at]
+      properties:
+        holder_type: { type: string, enum: [owner, agent] }
+        holder_id: { type: string }
+        available:
+          $ref: '#/components/schemas/Money'
+          description: Total available, expressed in the owner default currency.
+        pending_out:
+          $ref: '#/components/schemas/Money'
+          description: Reserved by in-flight payments and pending approvals.
+        currency_breakdown:
+          type: array
+          items: { $ref: '#/components/schemas/Money' }
+          description: Per-currency components of the balance.
+        updated_at: { type: string, format: date-time }
+
+    FundingInstructions:
+      type: object
+      required: [agent_id, methods]
+      properties:
+        agent_id: { type: string }
+        methods:
+          type: array
+          items:
+            type: object
+            required: [rail, account_name, reference]
+            properties:
+              rail:
+                type: string
+                description: Funding rail identifier.
+                examples: [bank_transfer_local, bank_transfer_international, fps, sepa_instant, ach]
+              account_name: { type: string }
+              account_number: { type: [string, 'null'] }
+              bank_name: { type: [string, 'null'] }
+              bank_identifier:
+                type: [string, 'null']
+                description: SWIFT/BIC, sort code, or local bank code as applicable.
+              currency: { type: string }
+              reference:
+                type: string
+                description: Must be included with the transfer for automatic crediting.
+
+    Transfer:
+      type: object
+      required: [id, source, destination, amount, status, created_at]
+      properties:
+        id: { type: string, examples: [trf_01JABCDXYZ] }
+        source: { $ref: '#/components/schemas/BalanceRef' }
+        destination: { $ref: '#/components/schemas/BalanceRef' }
+        amount: { $ref: '#/components/schemas/Money' }
+        status: { type: string, enum: [completed, pending_approval, cancelled] }
+        approval_id: { type: [string, 'null'] }
+        note: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+
+    BalanceRef:
+      type: object
+      required: [holder_type, holder_id]
+      properties:
+        holder_type: { type: string, enum: [owner, agent] }
+        holder_id: { type: string }
+
+    TransferCreate:
+      type: object
+      required: [source, destination, amount]
+      properties:
+        source: { $ref: '#/components/schemas/BalanceRef' }
+        destination: { $ref: '#/components/schemas/BalanceRef' }
+        amount: { $ref: '#/components/schemas/Money' }
+        note: { type: string, maxLength: 280 }
+
+    QuoteCreate:
+      type: object
+      required: [agent_id, destination_currency]
+      properties:
+        agent_id: { type: string }
+        source_amount:
+          $ref: '#/components/schemas/Money'
+          description: Provide source_amount OR destination_amount, not both.
+        destination_amount: { $ref: '#/components/schemas/Money' }
+        destination_currency: { type: string }
+        destination_country:
+          type: string
+          description: ISO 3166-1 alpha-2. Improves route selection.
+        counterparty_id:
+          type: string
+          description: If known, pins routing to rails that can reach this counterparty.
+
+    Quote:
+      type: object
+      required: [id, agent_id, source_amount, destination_amount, rate, fees, expires_at, created_at]
+      properties:
+        id: { type: string, examples: [qot_01JABCDXYZ] }
+        agent_id: { type: string }
+        source_amount: { $ref: '#/components/schemas/Money' }
+        destination_amount: { $ref: '#/components/schemas/Money' }
+        rate:
+          type: string
+          description: Decimal string, destination units per source unit, all-in.
+        fees:
+          type: array
+          items:
+            type: object
+            required: [type, amount]
+            properties:
+              type: { type: string, examples: [routing_fee, fx_spread, rail_fee] }
+              amount: { $ref: '#/components/schemas/Money' }
+        estimated_arrival:
+          type: string
+          description: Human estimate, e.g. "instant", "within 2 hours", "1–2 business days".
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    PaymentStatus:
+      type: string
+      enum: [pending_approval, processing, completed, failed, cancelled, returned]
+
+    PaymentCreate:
+      type: object
+      required: [agent_id, counterparty_id]
+      properties:
+        agent_id: { type: string }
+        counterparty_id: { type: string }
+        quote_id:
+          type: string
+          description: Executes at the quoted rate. Required for cross-currency payments; omit for same-currency.
+        amount:
+          $ref: '#/components/schemas/Money'
+          description: Required when no quote_id is given (same-currency payments).
+        reference:
+          type: string
+          maxLength: 140
+          description: Appears on the recipient statement where the rail supports it.
+        purpose:
+          type: string
+          maxLength: 280
+          description: Free-text purpose for the audit trail and the approval card the owner sees.
+
+    Payment:
+      type: object
+      required: [id, agent_id, counterparty_id, source_amount, status, created_at]
+      properties:
+        id: { type: string, examples: [pay_01JABCDXYZ] }
+        agent_id: { type: string }
+        credential_id:
+          type: string
+          description: The credential that initiated the payment. Attribution is never optional.
+        counterparty_id: { type: string }
+        quote_id: { type: [string, 'null'] }
+        source_amount: { $ref: '#/components/schemas/Money' }
+        destination_amount: { $ref: '#/components/schemas/Money' }
+        status: { $ref: '#/components/schemas/PaymentStatus' }
+        approval_id:
+          type: [string, 'null']
+          description: Present when the payment was (or is) held for approval.
+        failure_reason: { type: [string, 'null'] }
+        rail:
+          type: [string, 'null']
+          description: The rail Enstack Routing selected, e.g. `fps`, `pix`, `upi`, `sepa_instant`, `ach`, `bank_transfer`, `ewallet`.
+        reference: { type: [string, 'null'] }
+        purpose: { type: [string, 'null'] }
+        timeline:
+          type: array
+          description: Ordered status transitions with timestamps — the tracking view.
+          items:
+            type: object
+            required: [status, at]
+            properties:
+              status: { type: string }
+              at: { type: string, format: date-time }
+              detail: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+        completed_at: { type: [string, 'null'], format: date-time }
+
+    CounterpartyStatus:
+      type: string
+      enum: [unverified, verified, blocked]
+
+    CounterpartyCreate:
+      type: object
+      required: [display_name, destination]
+      properties:
+        display_name: { type: string, maxLength: 120 }
+        destination:
+          type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [bank_account, ewallet, card_payout]
+            currency: { type: string }
+            country: { type: string }
+            account_name: { type: string }
+            account_number: { type: string }
+            bank_identifier: { type: string, description: SWIFT/BIC or local bank code. }
+            ewallet_provider: { type: string }
+            ewallet_id: { type: string }
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+
+    Counterparty:
+      type: object
+      required: [id, display_name, destination_summary, status, created_at]
+      properties:
+        id: { type: string, examples: [cpt_01JABCDXYZ] }
+        display_name: { type: string }
+        destination_summary:
+          type: object
+          description: Masked destination details (never full account numbers on read).
+          properties:
+            type: { type: string }
+            currency: { type: string }
+            country: { type: string }
+            masked_identifier: { type: string, examples: ["••••4821"] }
+        status: { $ref: '#/components/schemas/CounterpartyStatus' }
+        created_by:
+          type: object
+          properties:
+            actor_type: { type: string, enum: [owner, agent] }
+            actor_id: { type: string }
+        created_at: { type: string, format: date-time }
+
+    CardCreate:
+      type: object
+      properties:
+        label: { type: string, maxLength: 60, description: Shown in the app and statements. }
+        form: { type: string, enum: [virtual], default: virtual, description: Physical cards land Phase 2. }
+
+    Card:
+      type: object
+      required: [id, agent_id, form, status, last4, created_at]
+      properties:
+        id: { type: string, examples: [crd_v_01JABCDXYZ] }
+        agent_id: { type: string }
+        label: { type: [string, 'null'] }
+        form: { type: string, enum: [virtual, physical] }
+        status: { type: string, enum: [active, frozen, terminated] }
+        network: { type: string, enum: [visa], default: visa }
+        last4: { type: string }
+        expiry_month: { type: integer }
+        expiry_year: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    VirtualAccountCreate:
+      type: object
+      properties:
+        currency:
+          type: string
+          description: Requested account currency. Availability varies by market.
+        label: { type: string, maxLength: 60 }
+
+    VirtualAccount:
+      type: object
+      required: [id, agent_id, account_name, status, created_at]
+      properties:
+        id: { type: string, examples: [va_01JABCDXYZ] }
+        agent_id: { type: string }
+        label: { type: [string, 'null'] }
+        account_name: { type: string }
+        account_number: { type: [string, 'null'] }
+        bank_name: { type: [string, 'null'] }
+        bank_identifier: { type: [string, 'null'] }
+        currency: { type: string }
+        supported_rails:
+          type: array
+          items: { type: string }
+        status: { type: string, enum: [provisioning, active, closed] }
+        created_at: { type: string, format: date-time }
+
+    ApprovalStatus:
+      type: string
+      enum: [pending, approved, rejected, expired]
+
+    Approval:
+      type: object
+      required: [id, agent_id, action_type, action_id, status, created_at]
+      properties:
+        id: { type: string, examples: [apr_01JABCDXYZ] }
+        agent_id: { type: string }
+        action_type: { type: string, enum: [payment, transfer, counterparty] }
+        action_id: { type: string }
+        trigger:
+          type: string
+          description: Which policy rule raised the approval.
+          examples: [require_approval_above, new_counterparty, cross_border]
+        summary:
+          type: object
+          description: Denormalized snapshot of the held action, rendered on the owner's approval card.
+          additionalProperties: true
+        status: { $ref: '#/components/schemas/ApprovalStatus' }
+        decided_by: { type: [string, 'null'] }
+        decided_at: { type: [string, 'null'], format: date-time }
+        note: { type: [string, 'null'] }
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    ActivityEvent:
+      type: object
+      required: [id, type, agent_id, occurred_at]
+      properties:
+        id: { type: string, examples: [evt_01JABCDXYZ] }
+        type:
+          type: string
+          description: Dot-notation event type, e.g. `payment.completed`, `card.authorization.declined`, `policy.evaluation`.
+        agent_id: { type: [string, 'null'] }
+        credential_id: { type: [string, 'null'] }
+        resource:
+          type: object
+          properties:
+            type: { type: string }
+            id: { type: string }
+        data:
+          type: object
+          additionalProperties: true
+          description: Event payload snapshot at time of occurrence (append-only; never mutated).
+        occurred_at: { type: string, format: date-time }
+
+    WebhookEndpointCreate:
+      type: object
+      required: [url, event_types]
+      properties:
+        url: { type: string, format: uri }
+        event_types:
+          type: array
+          minItems: 1
+          items: { type: string }
+          description: Dot-notation types or prefixes, e.g. `payment.*`, `approval.requested`.
+        label: { type: string, maxLength: 120 }
+
+    WebhookEndpoint:
+      type: object
+      required: [id, url, event_types, status, created_at]
+      properties:
+        id: { type: string, examples: [whe_01JABCDXYZ] }
+        url: { type: string, format: uri }
+        event_types:
+          type: array
+          items: { type: string }
+        label: { type: [string, 'null'] }
+        status: { type: string, enum: [active, disabled] }
+        created_at: { type: string, format: date-time }
+
+    WebhookEndpointWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEndpoint'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: HMAC-SHA256 signing secret. Shown once.

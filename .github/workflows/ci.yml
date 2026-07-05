@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: enos
+          POSTGRES_PASSWORD: enos
+          POSTGRES_DB: enos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U enos"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      ENOS_DATABASE_URL: postgresql+asyncpg://enos:enos@localhost:5432/enos_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Lint
+        run: uv run ruff check src tests scripts
+      - name: Guardrail — no floats in money paths
+        run: |
+          ! grep -rnE '\bfloat\(' src/enos/ledger src/enos/services src/enos/policy \
+            && echo "no float() in money math"
+      - name: Guardrail — no provider names outside the registry
+        run: |
+          ! grep -rniE '\b(banki|redotpay|fireblocks|circle|privy|turnkey|dfns|sgb)\b' src --include='*.py' \
+            --exclude-dir=providers && echo "provider abstraction intact"
+      - name: Migrate
+        run: uv run alembic upgrade head
+      - name: Spec round-trip check
+        run: uv run python scripts/spec_diff.py
+      - name: Tests
+        run: uv run pytest -q
